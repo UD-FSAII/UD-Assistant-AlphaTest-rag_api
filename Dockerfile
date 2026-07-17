@@ -15,8 +15,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Download standard NLTK data, to prevent unstructured from downloading packages at runtime
-RUN python -m nltk.downloader -d /app/nltk_data punkt_tab averaged_perceptron_tagger averaged_perceptron_tagger_eng
-ENV NLTK_DATA=/app/nltk_data
+# RUN python -m nltk.downloader -d /app/nltk_data punkt_tab averaged_perceptron_tagger averaged_perceptron_tagger_eng
+# ENV NLTK_DATA=/app/nltk_data
+
+RUN python -m nltk.downloader punkt_tab averaged_perceptron_tagger averaged_perceptron_tagger_eng
+ENV NLTK_DATA=/usr/local/share/nltk_data
 
 # Disable Unstructured analytics
 ENV SCARF_NO_ANALYTICS=true

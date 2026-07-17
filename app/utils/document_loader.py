@@ -24,6 +24,87 @@ from langchain_community.document_loaders import (
 )
 
 
+
+import io
+import urllib.request
+import urllib.error
+import json as _json
+import base64 as _base64
+
+# --- OCR fallback configuration (custom fork) ---
+OCR_FALLBACK_ENABLED = os.getenv("OCR_FALLBACK_ENABLED", "true").lower() == "true"
+OCR_FALLBACK_URL = os.getenv("OCR_FALLBACK_URL", "http://172.22.0.1:8003/v1/ocr")
+OCR_MIN_CHARS = int(os.getenv("OCR_FALLBACK_MIN_CHARS", "20"))
+OCR_TIMEOUT = int(os.getenv("OCR_FALLBACK_TIMEOUT", "120"))
+
+# --- Structure-aware markdown extraction (custom fork) ---
+# When enabled, PDFs are first run through the table-aware extractor
+# (app/ingest/pdf_extract.py) which produces clean Markdown with pipe tables kept
+# whole. This runs BEFORE the OCR fallback: text-bearing PDFs get structure-aware
+# markdown; scanned/image-only PDFs (near-empty result) fall through to OCR.
+# Figures (vision-model reading) are OFF by default here — they're slow and would
+# block the upload request; enable per-deployment only if you accept the latency.
+STRUCTURED_PDF_ENABLED = os.getenv("STRUCTURED_PDF_ENABLED", "true").lower() == "true"
+STRUCTURED_PDF_FIGURES = os.getenv("STRUCTURED_PDF_FIGURES", "false").lower() == "true"
+STRUCTURED_PDF_MIN_CHARS = int(os.getenv("STRUCTURED_PDF_MIN_CHARS", "40"))
+
+
+def _run_structured_pdf(filepath: str):
+    """Run the table-aware extractor; return clean markdown or "" on failure/empty.
+
+    Returns "" (so the caller falls through to OCR) when the PDF has no extractable
+    text — i.e. a scanned/image-only PDF — or if the extractor errors for any reason.
+    """
+    try:
+        from app.ingest.pdf_extract import extract_pdf_to_markdown
+    except Exception as e:  # module not present / import error -> disable silently
+        logger.warning(f"Structured PDF extractor unavailable: {e}")
+        return ""
+    try:
+        md = extract_pdf_to_markdown(filepath, include_figures=STRUCTURED_PDF_FIGURES)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Structured PDF extraction failed for {filepath}: {e}")
+        return ""
+    if len((md or "").strip()) < STRUCTURED_PDF_MIN_CHARS:
+        logger.info(
+            f"Structured extraction yielded {len((md or '').strip())} chars for "
+            f"{filepath}; treating as scanned -> OCR fallback."
+        )
+        return ""
+    logger.info(f"Structured PDF extraction produced {len(md)} chars for {filepath}.")
+    return md
+
+
+def _run_ocr_fallback(filepath: str) -> str:
+    """POST the PDF to the Mistral-OCR-compatible service; return page text or ""."""
+    try:
+        with open(filepath, "rb") as fh:
+            raw = fh.read()
+        b64 = _base64.b64encode(raw).decode("ascii")
+        payload = _json.dumps({
+            "model": "mistral-ocr-latest",
+            "document": {
+                "type": "document_url",
+                "document_url": "data:application/pdf;base64," + b64,
+            },
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            OCR_FALLBACK_URL, data=payload,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=OCR_TIMEOUT) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        pages = data.get("pages", []) or []
+        texts = [ (p.get("markdown") or "").strip() for p in pages ]
+        texts = [ t for t in texts if t ]
+        result = "\n\n".join(texts).strip()
+        logger.info(f"OCR fallback produced {len(result)} chars from {len(pages)} page(s) for {filepath}")
+        return result
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"OCR fallback failed for {filepath}: {e}")
+        return ""
+
+
 # Extensions that identify binary file formats handled by dedicated loaders.
 # Used to prevent a conflicting multipart Content-Type (e.g. ``text/markdown``)
 # from hijacking these files into a text loader.
@@ -261,32 +342,62 @@ class SafePyPDFLoader:
         self.extract_images = extract_images
         self._temp_filepath = None  # For compatibility with cleanup function
 
-    def lazy_load(self) -> Iterator[Document]:
-        """Lazy load PDF documents with automatic fallback on image extraction errors."""
+    def _raw_pages(self) -> List[Document]:
+        """Run PyPDF extraction with the existing image-extraction KeyError fallback."""
         loader = PyPDFLoader(self.filepath, extract_images=self.extract_images)
-
         if not self.extract_images:
-            # No image extraction: no fallback needed, stream directly
-            yield from loader.lazy_load()
-            return
-
-        # extract_images=True: must collect eagerly so that a mid-stream
-        # KeyError doesn't leave already-yielded pages duplicated by the
-        # fallback (yield from + try/except would deliver partial + full).
+            return list(loader.lazy_load())
         try:
-            pages = list(loader.lazy_load())
+            return list(loader.lazy_load())
         except KeyError as e:
             if "/Filter" in str(e):
                 logger.warning(
                     f"PDF image extraction failed for {self.filepath}, falling back to text-only: {e}"
                 )
                 fallback_loader = PyPDFLoader(self.filepath, extract_images=False)
-                pages = list(fallback_loader.lazy_load())
-            else:
-                # Re-raise if it's a different error
-                raise
-        yield from pages
+                return list(fallback_loader.lazy_load())
+            raise
+
+    def _pages_with_ocr(self) -> List[Document]:
+        """Return extracted pages, in tiers:
+
+        1. Structure-aware Markdown extraction (tables kept whole) — for text-bearing
+           PDFs. This is the custom fork's preferred path.
+        2. OCR fallback — for scanned/image-only PDFs (structure + PyPDF both empty).
+        3. Raw PyPDF pages — final fallback.
+
+        Applies to BOTH lazy_load() (embed path) and load().
+        """
+        # Tier 1: structure-aware markdown (tables preserved). Returns "" for
+        # scanned/image-only PDFs so we fall through to OCR.
+        if STRUCTURED_PDF_ENABLED:
+            md = _run_structured_pdf(self.filepath)
+            if md:
+                return [Document(
+                    page_content=md,
+                    metadata={"source": self.filepath, "extractor": "structured_md"},
+                )]
+
+        # Tier 2/3: existing behavior — raw PyPDF, with OCR fallback if near-empty.
+        pages = self._raw_pages()
+        if OCR_FALLBACK_ENABLED:
+            total_chars = sum(len((p.page_content or "").strip()) for p in pages)
+            if total_chars < OCR_MIN_CHARS:
+                logger.info(
+                    f"PDF {self.filepath} yielded only {total_chars} chars; attempting OCR fallback."
+                )
+                ocr_text = _run_ocr_fallback(self.filepath)
+                if ocr_text and len(ocr_text.strip()) >= OCR_MIN_CHARS:
+                    return [Document(page_content=ocr_text, metadata={"source": self.filepath})]
+                logger.warning(
+                    f"OCR fallback produced insufficient text for {self.filepath}; returning original extraction."
+                )
+        return pages
+
+    def lazy_load(self) -> Iterator[Document]:
+        """Lazy load PDF documents (with image-error fallback AND OCR fallback)."""
+        yield from self._pages_with_ocr()
 
     def load(self) -> List[Document]:
-        """Load PDF documents with automatic fallback on image extraction errors."""
-        return list(self.lazy_load())
+        """Load PDF documents (with image-error fallback AND OCR fallback)."""
+        return self._pages_with_ocr()
